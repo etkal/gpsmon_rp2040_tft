@@ -80,6 +80,16 @@
 // #define USE_WS2812_PIN 12 // Override
 // #define USE_LED_PIN 16    // Override
 
+extern "C"
+{
+    int _getentropy(void* buffer, size_t length)
+    {
+        (void)buffer;
+        (void)length;
+        return ENOSYS;
+    }
+}
+
 int main()
 {
     stdio_init_all();

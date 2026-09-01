@@ -11,7 +11,7 @@ auto constexpr g_szWifiPassword = "mypassword";
 
 // gpsd server and port to use
 auto constexpr g_szGpsdIpAddress = "10.0.1.62";
-auto constexpr g_szGpsdTcpPort = 2947;
+auto constexpr g_nGpsdTcpPort = 2947;
 
 // GMT Offset for clock display
 auto constexpr g_fGmtOffset = -5.0;

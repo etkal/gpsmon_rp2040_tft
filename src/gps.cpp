@@ -75,7 +75,7 @@ void GPS::Run()
 {
     // Set up connection to gpsd server
     ::ip4addr_aton(g_szGpsdIpAddress, &m_remoteAddr);
-    std::cout << "Connecting to " << ip4addr_ntoa(&m_remoteAddr) << " port " << g_szGpsdTcpPort << std::endl;
+    std::cout << "Connecting to " << ip4addr_ntoa(&m_remoteAddr) << " port " << g_nGpsdTcpPort << std::endl;
     m_pTcpPcb = tcp_new_ip_type(IP_GET_TYPE(m_remoteAddr));
 
     ::tcp_arg(m_pTcpPcb, this);
@@ -86,7 +86,7 @@ void GPS::Run()
     tcp_nagle_disable(m_pTcpPcb);
 
     ::cyw43_arch_lwip_begin();
-    err_t err = ::tcp_connect(m_pTcpPcb, &m_remoteAddr, g_szGpsdTcpPort, TCP_connected);
+    err_t err = ::tcp_connect(m_pTcpPcb, &m_remoteAddr, g_nGpsdTcpPort, TCP_connected);
     ::cyw43_arch_lwip_end();
 
     if (err != ERR_OK)
