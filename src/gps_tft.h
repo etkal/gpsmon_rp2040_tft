@@ -1,20 +1,25 @@
 /*
  * GPS using TFT display
  *
- * (c) 2024 Erik Tkal
+ * (c) 2024-2026 Erik Tkal
  *
  */
 
-#include <stdio.h>
-#include <pico/stdlib.h>
-#include <hardware/gpio.h>
-#include <hardware/uart.h>
+#pragma once
 
+#include <stdio.h>
 #include <memory>
 
-#include "ili_tft.h"
+#include "pico/stdlib.h"
+#include "pico/util/queue.h"
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+
+#include "timemgr.h"
 #include "gps.h"
+#include "ili_tft.h"
 #include "led.h"
+#include "font.h"
 
 // GPS_TFT class
 //
@@ -29,16 +34,16 @@ class GPS_TFT
 public:
     typedef std::shared_ptr<GPS_TFT> Shared;
 
-    GPS_TFT(ILI_TFT::Shared spDisplay, GPS::Shared spGPS, LED::Shared spLED, float GMToffset = 0.0);
+    GPS_TFT(ILI_TFT::Shared spDisplay, GPS::Shared spGPS, LED::Shared spLED);
     ~GPS_TFT();
 
     void Initialize();
     void Run();
 
 private:
-    static void sentenceCB(void* pCtx, std::string strSentence);
     static void gpsDataCB(void* pCtx, GPSData::Shared spGPSData);
 
+    void showWaitingForGPS();
     void updateUI(GPSData::Shared spGPSData);
     void drawSatGrid(uint xCenter, uint yCenter, uint radius, uint nRings = 3);
     void drawBarGraph(uint x, uint y, uint width, uint height);
@@ -49,15 +54,44 @@ private:
                        float elrad,
                        float azrad,
                        uint satRadius,
-                       uint16_t color     = COLOUR_WHITE,
+                       uint16_t color = COLOUR_WHITE,
                        uint16_t fillColor = COLOUR_WHITE);
     int linePos(int nLine);
     void drawText(int nLine, std::string strText, uint16_t color = COLOUR_WHITE, bool bRightAlign = true, uint nPadding = 0);
 
+    // Font management - delegates to m_spDisplay
+    void SetFont(const BitmapFont* pFont)
+    {
+        if (m_spDisplay)
+            m_spDisplay->SetFont(pFont);
+    }
+    const BitmapFont* GetFont() const
+    {
+        return m_spDisplay ? m_spDisplay->GetFont() : nullptr;
+    }
+
+    // Get current font dimensions dynamically from display's font
+    inline uint getCharWidth() const
+    {
+        const BitmapFont* pFont = GetFont();
+        return pFont ? pFont->width : 8;
+    }
+    inline uint getCharHeight() const
+    {
+        const BitmapFont* pFont = GetFont();
+        return pFont ? pFont->height : 8;
+    }
+    inline uint getLineAdvance() const
+    {
+        const BitmapFont* pFont = GetFont();
+        return pFont ? pFont->effectiveLineAdvance() : 8;
+    }
+
     ILI_TFT::Shared m_spDisplay;
     GPS::Shared m_spGPS;
     LED::Shared m_spLED;
-    float m_GMToffset;
-
-    GPSData::Shared m_spGPSData;
+    GPSData::Shared m_spGPSData;            // Current data being used for display
+    uint64_t m_nLastTimeSyncAttemptSec;
+    queue_t m_qGPSData; // Queue of GPS data to be processed by the display loop
+    AlarmTimer::Shared m_spIdleTimer;     // Timer to detect lack of GPS data
 };

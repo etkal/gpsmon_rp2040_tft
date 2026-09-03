@@ -1,7 +1,7 @@
 /*
  * Framebuffer implementation, rewritten from MicroPython modframebuf.c
  *
- * This version (c) 2024 Erik Tkal
+ * This version (c) 2024-2026 Erik Tkal
  *
  * Original copyright:
  *
@@ -28,10 +28,12 @@
  * THE SOFTWARE.
  */
 
+#include "framebuf.h"
+
 #include <algorithm>
 #include <iostream>
 
-#include "framebuf.h"
+#include "font.h"
 #include "font_petme128_8x8.h"
 
 using std::max;
@@ -40,11 +42,13 @@ using std::size_t;
 
 Framebuf::Framebuf()
     : m_pBuf(nullptr),
+      m_nPixelSize(0),
       m_nWidth(0),
       m_nHeight(0),
       m_nStride(0),
-      m_eFormat(RGB565),
-      m_bRevBytes(false)
+      m_eFormat(DISPLAY_COLOUR_FORMAT),
+      m_bRevBytes(false),
+      m_pFont(nullptr)
 {
 }
 
@@ -64,6 +68,9 @@ Framebuf::~Framebuf()
     case RGB565:
         delete[] (uint16_t*)m_pBuf;
         break;
+    case RGB666:
+        delete[] (pixel666*)m_pBuf;
+        break;
     default:
         break;
     }
@@ -71,9 +78,9 @@ Framebuf::~Framebuf()
 
 void Framebuf::Initialize(uint16_t nWidth, uint16_t nHeight, ePixelFormat eFormat, bool bRevBytes, uint16_t nStride)
 {
-    m_nWidth    = nWidth;
-    m_nHeight   = nHeight;
-    m_eFormat   = eFormat;
+    m_nWidth = nWidth;
+    m_nHeight = nHeight;
+    m_eFormat = eFormat;
     m_bRevBytes = bRevBytes;
     if (0 == nStride)
     {
@@ -84,11 +91,29 @@ void Framebuf::Initialize(uint16_t nWidth, uint16_t nHeight, ePixelFormat eForma
     case MVLSB:
     case MHLSB:
     case MHMSB:
-        m_pBuf    = new uint8_t[m_nWidth * m_nHeight / 8];
+        if (nullptr != m_pBuf)
+        {
+            delete[] (uint8_t*)m_pBuf;
+        }
+        m_pBuf = new uint8_t[m_nWidth * m_nHeight / 8];
         m_nStride = (m_nStride + 7) & ~7;
+        m_nPixelSize = 1;
         break;
     case RGB565:
+        if (nullptr != m_pBuf)
+        {
+            delete[] (uint16_t*)m_pBuf;
+        }
         m_pBuf = new uint16_t[m_nWidth * m_nHeight];
+        m_nPixelSize = 2;
+        break;
+    case RGB666:
+        if (nullptr != m_pBuf)
+        {
+            delete[] (pixel666*)m_pBuf;
+        }
+        m_pBuf = new pixel666[m_nWidth * m_nHeight];
+        m_nPixelSize = 3;
         break;
     default:
         m_pBuf = nullptr;
@@ -107,14 +132,19 @@ void Framebuf::setpixel(int x, int y, uint16_t color)
     {
     case MVLSB:
     {
-        size_t index              = (y >> 3) * m_nStride + x;
-        uint8_t offset            = y & 0x07;
+        size_t index = (y >> 3) * m_nStride + x;
+        uint8_t offset = y & 0x07;
         ((uint8_t*)m_pBuf)[index] = (((uint8_t*)m_pBuf)[index] & ~(0x01 << offset)) | ((color != 0) << offset);
     }
     break;
     case RGB565:
     {
         ((uint16_t*)m_pBuf)[x + y * m_nStride] = fixcolor(color);
+    }
+    break;
+    case RGB666:
+    {
+        ((pixel666*)m_pBuf)[x + y * m_nStride] = color;
     }
     break;
     default:
@@ -137,6 +167,9 @@ uint16_t Framebuf::getpixel(int x, int y)
     case RGB565:
         return ((uint16_t*)m_pBuf)[x + y * m_nStride];
         break;
+    case RGB666:
+        return ((pixel666*)m_pBuf)[x + y * m_nStride];
+        break;
     default:
         return 0;
         break;
@@ -154,7 +187,7 @@ void Framebuf::fillrect(int x, int y, int w, int h, uint16_t color)
     case MVLSB:
         while (h--)
         {
-            uint8_t* b     = &((uint8_t*)m_pBuf)[(y >> 3) * m_nStride + x];
+            uint8_t* b = &((uint8_t*)m_pBuf)[(y >> 3) * m_nStride + x];
             uint8_t offset = y & 0x07;
             for (unsigned int ww = w; ww; --ww)
             {
@@ -172,6 +205,19 @@ void Framebuf::fillrect(int x, int y, int w, int h, uint16_t color)
             for (unsigned int ww = w; ww; --ww)
             {
                 *b++ = fixcolor(color);
+            }
+            b += m_nStride - w;
+        }
+    }
+    break;
+    case RGB666:
+    {
+        pixel666* b = &((pixel666*)m_pBuf)[x + y * m_nStride];
+        while (h--)
+        {
+            for (unsigned int ww = w; ww; --ww)
+            {
+                *b++ = color;
             }
             b += m_nStride - w;
         }
@@ -242,15 +288,15 @@ void Framebuf::line(int x1, int y1, int x2, int y2, uint16_t color)
     if (dy > dx)
     {
         int temp;
-        temp  = x1;
-        x1    = y1;
-        y1    = temp;
-        temp  = dx;
-        dx    = dy;
-        dy    = temp;
-        temp  = sx;
-        sx    = sy;
-        sy    = temp;
+        temp = x1;
+        x1 = y1;
+        y1 = temp;
+        temp = dx;
+        dx = dy;
+        dy = temp;
+        temp = sx;
+        sx = sy;
+        sy = temp;
         steep = true;
     }
     else
@@ -293,15 +339,15 @@ void Framebuf::ellipse(int cx, int cy, int xradius, int yradius, uint16_t color,
     {
         mask |= ELLIPSE_MASK_FILL;
     }
-    int two_asquare   = 2 * xradius * xradius;
-    int two_bsquare   = 2 * yradius * yradius;
-    int x             = xradius;
-    int y             = 0;
-    int xchange       = yradius * yradius * (1 - 2 * xradius);
-    int ychange       = xradius * xradius;
+    int two_asquare = 2 * xradius * xradius;
+    int two_bsquare = 2 * yradius * yradius;
+    int x = xradius;
+    int y = 0;
+    int xchange = yradius * yradius * (1 - 2 * xradius);
+    int ychange = xradius * xradius;
     int ellipse_error = 0;
-    int stoppingx     = two_bsquare * xradius;
-    int stoppingy     = 0;
+    int stoppingx = two_bsquare * xradius;
+    int stoppingy = 0;
     while (stoppingx >= stoppingy)
     { // 1st set of points,  y' > -1
         ellipse_points(cx, cy, x, y, color, mask);
@@ -318,13 +364,13 @@ void Framebuf::ellipse(int cx, int cy, int xradius, int yradius, uint16_t color,
         }
     }
     // 1st point set is done start the 2nd set of points
-    x             = 0;
-    y             = yradius;
-    xchange       = yradius * yradius;
-    ychange       = xradius * xradius * (1 - 2 * yradius);
+    x = 0;
+    y = yradius;
+    xchange = yradius * yradius;
+    ychange = xradius * xradius * (1 - 2 * yradius);
     ellipse_error = 0;
-    stoppingx     = 0;
-    stoppingy     = two_asquare * yradius;
+    stoppingx = 0;
+    stoppingy = two_asquare * yradius;
     while (stoppingx <= stoppingy)
     { // 2nd set of points, y' < -1
         ellipse_points(cx, cy, x, y, color, mask);
@@ -345,6 +391,12 @@ void Framebuf::ellipse(int cx, int cy, int xradius, int yradius, uint16_t color,
 
 void Framebuf::text(const char* str, int x, int y, uint16_t color)
 {
+    // If a default font is set, use it
+    if (m_pFont)
+    {
+        return text(str, x, y, color, *m_pFont, 1);
+    }
+
     // loop over chars
     for (; *str; ++str)
     {
@@ -377,6 +429,159 @@ void Framebuf::text(const char* str, int x, int y, uint16_t color)
     }
 }
 
+void Framebuf::text(const char* str, int x, int y, uint16_t color, int scale)
+{
+    if (scale <= 1)
+    {
+        return text(str, x, y, color);
+    }
+
+    // If a default font is set, use it
+    if (m_pFont)
+    {
+        return text(str, x, y, color, *m_pFont, scale);
+    }
+
+    // loop over chars
+    for (; *str; ++str)
+    {
+        int chr = *(uint8_t*)str;
+        if (chr < 32 || chr > 127)
+        {
+            chr = 127;
+        }
+        const uint8_t* chr_data = &font_petme128_8x8[(chr - 32) * 8];
+
+        int xchar = x; // starting x for this character
+        for (int j = 0; j < 8; j++, xchar += scale)
+        {
+            if (0 <= xchar && xchar < m_nWidth)
+            {
+                uint vline_data = chr_data[j];
+                for (int row = 0; vline_data; vline_data >>= 1, ++row)
+                {
+                    if (vline_data & 1)
+                    {
+                        int ybase = y + row * scale;
+                        for (int sx = 0; sx < scale; ++sx)
+                        {
+                            for (int sy = 0; sy < scale; ++sy)
+                            {
+                                int px = xchar + sx;
+                                int py = ybase + sy;
+                                if (0 <= px && px < m_nWidth && 0 <= py && py < m_nHeight)
+                                {
+                                    setpixel(px, py, color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        x += 8 * scale; // advance to next character
+    }
+}
+
+void Framebuf::text(const char* str, int x, int y, uint16_t color, const BitmapFont& font, int scale)
+{
+    if (scale < 1)
+    {
+        scale = 1;
+    }
+
+    const int first = font.firstChar;
+    const int count = font.charCount;
+    const int gw = font.width;
+    const int gh = font.height;
+    const int rowBytes = font.rowBytes();
+    const size_t glyphSize = rowBytes * gh;
+
+    if (font.colMajor)
+    {
+        // Column-major format: bytes represent columns (e.g., PetMe 8x8)
+        // Each byte is a column, with LSB=top, MSB=bottom
+        for (; *str; ++str)
+        {
+            int chr = (uint8_t)*str;
+            if (chr < first || chr >= first + count)
+            {
+                chr = first + count - 1;
+            }
+            const uint8_t* glyph = font.data + (chr - first) * glyphSize;
+
+            // For column-major: iterate columns (rx), then rows within that column
+            for (int rx = 0; rx < gw; ++rx)
+            {
+                uint8_t col_byte = glyph[rx];
+                for (int ry = 0; ry < gh; ++ry)
+                {
+                    uint8_t mask = 1 << (ry % 8); // LSB is top
+                    if (col_byte & mask)
+                    {
+                        int xbase = x + rx * scale;
+                        int ybase = y + ry * scale;
+                        for (int sx = 0; sx < scale; ++sx)
+                        {
+                            for (int sy = 0; sy < scale; ++sy)
+                            {
+                                int px = xbase + sx;
+                                int py = ybase + sy;
+                                if (0 <= px && px < (int)m_nWidth && 0 <= py && py < (int)m_nHeight)
+                                {
+                                    setpixel(px, py, color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            x += gw * scale;
+        }
+    }
+    else
+    {
+        // Row-major format: bytes represent rows (standard, e.g., Terminus fonts)
+        for (; *str; ++str)
+        {
+            int chr = (uint8_t)*str;
+            if (chr < first || chr >= first + count)
+            {
+                chr = first + count - 1;
+            }
+            const uint8_t* glyph = font.data + (chr - first) * glyphSize;
+
+            for (int ry = 0; ry < gh; ++ry)
+            {
+                const uint8_t* rowPtr = glyph + ry * rowBytes;
+                for (int rx = 0; rx < gw; ++rx)
+                {
+                    int byteIndex = rx / 8;
+                    uint8_t mask = 0x80 >> (rx % 8);
+                    if (rowPtr[byteIndex] & mask)
+                    {
+                        int xbase = x + rx * scale;
+                        int ybase = y + ry * scale;
+                        for (int sx = 0; sx < scale; ++sx)
+                        {
+                            for (int sy = 0; sy < scale; ++sy)
+                            {
+                                int px = xbase + sx;
+                                int py = ybase + sy;
+                                if (0 <= px && px < (int)m_nWidth && 0 <= py && py < (int)m_nHeight)
+                                {
+                                    setpixel(px, py, color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            x += gw * scale;
+        }
+    }
+}
+
 // Private methods
 
 bool Framebuf::check(int& x, int& y)
@@ -393,10 +598,10 @@ bool Framebuf::check(int& x, int& y, int& w, int& h)
     // clip to the framebuffer size
     int xend = min((int)m_nWidth, x + w);
     int yend = min((int)m_nHeight, y + h);
-    x        = max(x, 0);
-    y        = max(y, 0);
-    w        = xend - x;
-    h        = yend - y;
+    x = max(x, 0);
+    y = max(y, 0);
+    w = xend - x;
+    h = yend - y;
     return true;
 }
 
@@ -443,7 +648,7 @@ void Framebuf::scroll(int xstep, int ystep)
     int sx, y, xend, yend, dx, dy;
     if (xstep < 0)
     {
-        sx   = 0;
+        sx = 0;
         xend = m_nWidth + xstep;
         if (xend <= 0)
         {
@@ -453,7 +658,7 @@ void Framebuf::scroll(int xstep, int ystep)
     }
     else
     {
-        sx   = m_nWidth - 1;
+        sx = m_nWidth - 1;
         xend = xstep - 1;
         if (xend >= sx)
         {
@@ -463,7 +668,7 @@ void Framebuf::scroll(int xstep, int ystep)
     }
     if (ystep < 0)
     {
-        y    = 0;
+        y = 0;
         yend = m_nHeight + ystep;
         if (yend <= 0)
         {
@@ -473,7 +678,7 @@ void Framebuf::scroll(int xstep, int ystep)
     }
     else
     {
-        y    = m_nHeight - 1;
+        y = m_nHeight - 1;
         yend = ystep - 1;
         if (yend >= y)
         {
