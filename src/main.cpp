@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Erik Tkal
+ * Copyright (c) 2025-2026 Erik Tkal
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -20,19 +20,18 @@
  * THE SOFTWARE.
  */
 
-// This implementation uses TCPIP to connect to a gpsd server instead of a local GPS module.
-
 #include <iostream>
-#include <pico/stdlib.h>
-#include "hardware/adc.h"
 
-#if defined(RASPBERRYPI_PICO_W)
+#include "pico/stdlib.h"
+#include "hardware/adc.h"
+#if defined(PLATFORM_PICO_W)
 #include "pico/cyw43_arch.h"
-#else
-#error PICO W required
 #endif
 
+#include "gps_gpsd.h"
 #include "gps_tft.h"
+#include "font_factory.h"
+#include "timemgr.h"
 #include "network_info.h"
 
 #if defined(DISPLAY_PICO_RESTOUCH) // Waveshare Pico-ResTouch-LCD-3.5
@@ -44,7 +43,7 @@
 #define PIN_MISO   12
 #define PIN_BL     13
 #define PIN_RST    15
-#elif defined(RASPBERRYPI_PICO) || defined(RASPBERRYPI_PICO_W)
+#elif defined(PLATFORM_PICO)                // Pico, Pico W, Pico 2, Pico 2 W
 #define SPI_DEVICE spi_default              // Default is SPI0 for Pico
 #define PIN_MISO   PICO_DEFAULT_SPI_RX_PIN  // White  16
 #define PIN_CS     PICO_DEFAULT_SPI_CSN_PIN // Org    17
@@ -80,6 +79,10 @@
 // #define USE_WS2812_PIN 12 // Override
 // #define USE_LED_PIN 16    // Override
 
+#if !defined(DISPLAY_SPI_SPEED)
+#define DISPLAY_SPI_SPEED 20000000 // 20MHz
+#endif
+
 extern "C"
 {
     int _getentropy(void* buffer, size_t length)
@@ -90,26 +93,21 @@ extern "C"
     }
 }
 
+#if !defined(NDEBUG)
+void SplashDemo(ILI_TFT::Shared spDisplay);
+#endif
+
 int main()
 {
     stdio_init_all();
     adc_init();
 
-    // Set up the TFT display
-    spi_init(SPI_DEVICE, 80000000);
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    gpio_init(PIN_CS);
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1);
-    gpio_init(PIN_DC);
-    gpio_set_dir(PIN_DC, GPIO_OUT);
-    gpio_init(PIN_RST);
-    gpio_set_dir(PIN_RST, GPIO_OUT);
-    gpio_init(PIN_BL);
-    gpio_set_dir(PIN_BL, GPIO_OUT);
-    gpio_put(PIN_BL, 1);
+#if !defined(NDEBUG)
+    sleep_ms(5000);
+#endif
+
+    TimeMgr::InitializeSingleton(TIME_ZONE);
+    LogInfo("Starting GPS TFT application...");
 
 #if defined(SEEED_XIAO_RP2040)
     // Clear LED(s) on XIAO (default on)
@@ -120,7 +118,7 @@ int main()
 
     if (cyw43_arch_init())
     {
-        std::cout << "Failed to initialize wifi" << std::endl;
+        std::cout << "Failed to initialize wifi hardware" << std::endl;
         return 1;
     }
 
@@ -136,51 +134,138 @@ int main()
     spLED->SetPixel(0, led_green);
 #elif defined(USE_LED_PIN)
     spLED = std::make_shared<LED_pico>(USE_LED_PIN);
-    spLED->SetIgnore({led_red});
+    spLED->Initialize();
+    spLED->SetIgnore({led_red, led_magenta});
 #elif defined(PICO_DEFAULT_LED_PIN)
     spLED = std::make_shared<LED_pico>(PICO_DEFAULT_LED_PIN);
-    spLED->SetIgnore({led_red});
-#elif defined(RASPBERRYPI_PICO_W)
+    spLED->Initialize();
+    spLED->SetIgnore({led_red, led_magenta});
+#elif defined(PLATFORM_PICO_W)
     spLED = std::make_shared<LED_pico_w>(CYW43_WL_GPIO_LED_PIN);
-    spLED->SetIgnore({led_red});
+    spLED->Initialize();
+    spLED->SetIgnore({led_red, led_magenta});
 #endif
 
+    LogInfo("Creating GPS object...");
     // Create the GPS object
-    GPS::Shared spGPS = std::make_shared<GPS>();
+    GPS_gpsd::Shared spGPS = std::make_shared<GPS_gpsd>();
 
-    // Create the display.  ILI9341 or ILI9488, rotate 270 degrees
-#if defined(DISPLAY_ILI948X)
-    ILI_TFT::Shared spDisplay = std::make_shared<ILI948X>(SPI_DEVICE, PIN_CS, PIN_DC, PIN_RST, R270DEG);
-#elif defined(DISPLAY_ILI934X)
-    ILI_TFT::Shared spDisplay = std::make_shared<ILI934X>(SPI_DEVICE, PIN_CS, PIN_DC, PIN_RST, R270DEG);
+    LogInfo("Creating display object...");
+    // Create the display. ILI9341 or ILI9488, rotate 270 degrees for landscape.
+#if defined(DISPLAY_ILI934X)
+    ILI934X::Shared spDisplay =
+        std::make_shared<ILI934X>(SPI_DEVICE, PIN_MISO, PIN_MOSI, PIN_SCK, PIN_CS, PIN_DC, PIN_RST, PIN_BL, DISPLAY_ROTATION);
+#elif defined(DISPLAY_ILI948X)
+    ILI948X::Shared spDisplay =
+        std::make_shared<ILI948X>(SPI_DEVICE, PIN_MISO, PIN_MOSI, PIN_SCK, PIN_CS, PIN_DC, PIN_RST, PIN_BL, DISPLAY_ROTATION);
+#elif defined(DISPLAY_ST7796)
+    ST7796::Shared spDisplay =
+        std::make_shared<ST7796>(SPI_DEVICE, PIN_MISO, PIN_MOSI, PIN_SCK, PIN_CS, PIN_DC, PIN_RST, PIN_BL, DISPLAY_ROTATION);
 #else
 #error Unsupported display specified
 #endif
 
+    LogInfo("Initializing display object...");
+    spDisplay->Initialize();
+    LogInfo("Clearing display...");
+    spDisplay->Clear(COLOUR_BLACK);
+
+#if !defined(NDEBUG)
+    LogInfo("Showing splash demo...");
+    SplashDemo(spDisplay);
+    spDisplay->Clear(COLOUR_BLACK);
+#endif
+
     // Create the GPS_TFT display object
-    GPS_TFT::Shared spDevice = std::make_shared<GPS_TFT>(spDisplay, spGPS, spLED, g_fGmtOffset);
+    GPS_TFT::Shared spDevice = std::make_shared<GPS_TFT>(spDisplay, spGPS, spLED);
 
     spDevice->Initialize();
-
-    // Connect to wifi
-    cyw43_arch_enable_sta_mode();
-    cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM & ~0xf);
-    while (true)
-    {
-        std::cout << "Connecting to wifi..." << std::endl;
-        if (cyw43_arch_wifi_connect_timeout_ms(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK, 5000))
-        {
-            std::cout << "Failed to connect to wifi" << std::endl;
-            continue;
-        }
-        break;
-    }
-    std::cout << "Connected to " << g_szWifiSsid << std::endl;
 
     // Run the show
     spDevice->Run();
 
+#if defined(PLATFORM_PICO_W)
     cyw43_arch_deinit();
+#endif
 
+    LogInfo("Exiting...");
     return 0;
 }
+
+#if !defined(NDEBUG)
+void SplashDemo(ILI_TFT::Shared spDisplay)
+{
+    // Palette demo splash: show all 16 named RGB565 colors with labels
+    struct NamedColour
+    {
+        const char* name;
+        const char* hex;
+        uint16_t value;
+    };
+
+    static const NamedColour colours[16] = {
+        {"BLACK",   "0x0000", COLOUR_BLACK  },
+        {"MAROON",  "0x8000", COLOUR_MAROON },
+        {"GREEN",   "0x0400", COLOUR_GREEN  },
+        {"OLIVE",   "0x8400", COLOUR_OLIVE  },
+        {"NAVY",    "0x0010", COLOUR_NAVY   },
+        {"PURPLE",  "0x8010", COLOUR_PURPLE },
+        {"TEAL",    "0x0410", COLOUR_TEAL   },
+        {"SILVER",  "0xC618", COLOUR_SILVER },
+        {"GRAY",    "0x8410", COLOUR_GRAY   },
+        {"RED",     "0xF800", COLOUR_RED    },
+        {"LIME",    "0x07E0", COLOUR_LIME   },
+        {"YELLOW",  "0xFFE0", COLOUR_YELLOW },
+        {"BLUE",    "0x001F", COLOUR_BLUE   },
+        {"FUCHSIA", "0xF81F", COLOUR_FUCHSIA},
+        {"AQUA",    "0x07FF", COLOUR_AQUA   },
+        {"WHITE",   "0xFFFF", COLOUR_WHITE  },
+    };
+
+    auto text_colour_for_bg = [](uint16_t c) -> uint16_t {
+        uint8_t r5 = (c >> 11) & 0x1f;
+        uint8_t g6 = (c >> 5) & 0x3f;
+        uint8_t b5 = c & 0x1f;
+        uint16_t r = (r5 * 255) / 31;
+        uint16_t g = (g6 * 255) / 63;
+        uint16_t b = (b5 * 255) / 31;
+        uint16_t luma = static_cast<uint16_t>((299u * r + 587u * g + 114u * b) / 1000u);
+        return (luma > 140) ? COLOUR_BLACK : COLOUR_WHITE;
+    };
+
+    const int cols = 4;
+    const int rows = 4;
+    int dispW = spDisplay->Width();
+    int dispH = spDisplay->Height();
+    int cellW = dispW / cols;
+    int cellH = dispH / rows;
+
+    auto nFontSize = spDisplay->get_recommended_font_size();
+    // Initialize display
+    spDisplay->SetFont(get_recommended_font(nFontSize));
+
+    for (auto nQuadrant : spDisplay->GetQuadrants())
+    {
+        spDisplay->SetQuadrant(nQuadrant);
+        spDisplay->Fill(COLOUR_BLACK);
+        for (int i = 0; i < 16; ++i)
+        {
+            int col = i % cols;
+            int row = i / cols;
+            int x = col * cellW;
+            int y = row * cellH;
+            int w = (col == cols - 1) ? (dispW - x) : cellW;
+            int h = (row == rows - 1) ? (dispH - y) : cellH;
+
+            spDisplay->FillRect(x, y, w, h, colours[i].value);
+            uint16_t textColour = text_colour_for_bg(colours[i].value);
+            spDisplay->Text(colours[i].name, x + 3, y + 3, textColour);
+            spDisplay->Text(colours[i].hex, x + 3, y + spDisplay->GetFont()->height + 3, textColour);
+        }
+
+        spDisplay->Show();
+    }
+    sleep_ms(2000);
+    spDisplay->Clear(COLOUR_BLACK);
+}
+#endif
