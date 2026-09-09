@@ -15,8 +15,9 @@
 #include "pico/sync.h"
 #include "pico/util/queue.h"
 
-auto constexpr GPS_BUFSIZE = 256;   // Max NMEA-0183 sentence length is actually 82 characters
-auto constexpr GPS_QUEUE_SIZE = 16; // Number of sentences to queue
+auto constexpr GPS_BUFSIZE = 256;       // Max NMEA-0183 sentence length is actually 82 characters
+auto constexpr GPS_QUEUE_SIZE = 16;     // Number of sentences to queue
+auto constexpr GPS_RING_BUFSIZE = 4096; // Circular ring buffer size
 
 class GPS_gpsd : public GPS
 {
@@ -48,8 +49,17 @@ private:
     // TCP RX management
     struct tcp_pcb* m_pTcpPcb {nullptr};
     ip_addr_t m_remoteAddr {};
-    char sm_szBuffer[GPS_BUFSIZE] {};
-    size_t m_sentenceLength {0};
+
+    // RX management (circular ring buffer)
+    void processRingBytes(const uint8_t* pBuf, size_t nLen);
+
+    // Ring buffer state
+    volatile size_t m_iRingReadPos {0};  // our read offset into the circular buffer
+    volatile size_t m_iRingWritePos {0}; // write offset into the circular buffer
+    char m_szBuf[GPS_BUFSIZE] {};        // current sentence assembly buffer
+    size_t m_iNext {0};                 // write offset into m_szBuf
+    // Circular buffer for TCP RX
+    char m_szRingBuf[GPS_RING_BUFSIZE] {};
 
     // Queue for received sentences
     queue_t m_qSentences;

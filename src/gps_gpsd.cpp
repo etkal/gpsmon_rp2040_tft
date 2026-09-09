@@ -40,9 +40,33 @@ void GPS_gpsd::Initialize()
     LogInfo("Connecting to Wi-Fi");
     cyw43_arch_enable_sta_mode();
     cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM & ~0xf);
-    while (cyw43_arch_wifi_connect_timeout_ms(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK, 5000))
+    // while (cyw43_arch_wifi_connect_timeout_ms(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK, 5000))
+    // {
+    //     LogInfo("Failed to connect to Wi-Fi; retrying");
+    //     cyw43_arch_poll();
+    // }
+    bool bConnected = false;
+    while (!bConnected)
     {
-        LogInfo("Failed to connect to Wi-Fi; retrying");
+        std::cout << "Calling cyw43_arch_wifi_connect_async" << std::endl;
+        cyw43_arch_wifi_connect_async(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK);
+        absolute_time_t timeout = make_timeout_time_ms(5000);
+        while (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
+        {
+            cyw43_arch_poll();
+            sleep_ms(10);
+            if (absolute_time_diff_us(get_absolute_time(), timeout) < 0)
+            {
+                // Handle timeout error
+                std::cout << "Failed to connect to Wi-Fi; retrying" << std::endl;
+                break;
+            }
+        }
+        std::cout << "Calling cyw43_tcpip_link_status" << std::endl;
+        if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP)
+        {
+            bConnected = true;
+        }
     }
     LogInfo("Connected to Wi-Fi");
 
@@ -167,33 +191,51 @@ err_t GPS_gpsd::onTcpRecv(struct tcp_pcb* pcb, struct pbuf* p, err_t err)
         const char* payload = static_cast<const char*>(buffer->payload);
         for (uint16_t index = 0; index < buffer->len; ++index)
         {
-            char character = payload[index];
-            if (m_sentenceLength < sizeof(sm_szBuffer) - 1)
-            {
-                sm_szBuffer[m_sentenceLength++] = character;
-            }
-            else
-            {
-                m_sentenceLength = 0;
-            }
-
-            if (character == '\n')
-            {
-                sm_szBuffer[m_sentenceLength] = '\0';
-                if (!queue_try_add(&m_qSentences, sm_szBuffer))
-                {
-                    // Should never happen if the queue is sized appropriately. Using the queue_get_max_level()
-                    // function (if so compiled) shows the queue never exceeded 1 in testing, so a queue size
-                    // of 16 is more than sufficient.
-                    printf("Queue full\n");
-                }
-                m_sentenceLength = 0;
-            }
+            m_szRingBuf[m_iRingWritePos] = payload[index];
+            m_iRingWritePos = (m_iRingWritePos + 1) % GPS_RING_BUFSIZE;
         }
     }
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     return ERR_OK;
+}
+
+// Feed received bytes into the sentence assembly buffer. Completed sentences are queued for the main loop.
+void GPS_gpsd::processRingBytes(const uint8_t* pBuf, size_t nLen)
+{
+    for (size_t i = 0; i < nLen; ++i)
+    {
+        char ch = static_cast<char>(pBuf[i]);
+        if (ch == '$')
+        {
+            // Start of a new NMEA sentence
+            m_iNext = 0;
+            m_szBuf[m_iNext++] = ch;
+        }
+        else if (m_iNext > 0)
+        {
+            if (m_iNext < GPS_BUFSIZE - 1)
+            {
+                m_szBuf[m_iNext++] = ch;
+            }
+            else
+            {
+                // Overflow without newline; reset buffer
+                m_iNext = 0;
+            }
+
+            if (ch == '\n')
+            {
+                m_szBuf[m_iNext] = '\0';
+                if (!queue_try_add(&m_qSentences, m_szBuf))
+                {
+                    // Should never happen if the queue is sized appropriately
+                    printf("Queue full\n");
+                }
+                m_iNext = 0;
+            }
+        }
+    }
 }
 
 void GPS_gpsd::onTcpError(err_t err)
@@ -206,6 +248,29 @@ void GPS_gpsd::onTcpError(err_t err)
 // Get a sentence from the queue. This function will return false if no sentence is available.
 bool GPS_gpsd::getSentence(std::string& strSentence)
 {
+    // Poll the lwip stack
+    cyw43_arch_poll();
+
+    // Drain any bytes written to the circular buffer since our last pass.
+    size_t nWritePos = m_iRingWritePos;
+    size_t nReadPos = m_iRingReadPos;
+
+    if (nWritePos != nReadPos)
+    {
+        if (nWritePos > nReadPos)
+        {
+            // Contiguous region: read [readPos, writePos)
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, nWritePos - nReadPos);
+        }
+        else
+        {
+            // Wrapped: read [readPos, end) then [0, writePos)
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, GPS_RING_BUFSIZE - nReadPos);
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf), nWritePos);
+        }
+        m_iRingReadPos = nWritePos;
+    }
+
     bool bFound = false;
 
     // Check if there are any sentences in the queue. If so, remove one and return it.
@@ -215,7 +280,7 @@ bool GPS_gpsd::getSentence(std::string& strSentence)
         if (queue_try_remove(&m_qSentences, szBuffer))
         {
             strSentence = std::string(szBuffer);
-            bFound      = true;
+            bFound = true;
         }
     }
     return bFound;
