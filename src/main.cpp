@@ -273,6 +273,5 @@ void SplashDemo(ILI_TFT::Shared spDisplay)
         spDisplay->Show();
     }
     sleep_ms(2000);
-    spDisplay->Clear(COLOUR_BLACK);
 }
 #endif
