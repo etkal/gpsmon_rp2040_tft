@@ -7,6 +7,7 @@
 
 #include "gps_gpsd.h"
 
+#include <algorithm>
 #include <iostream>
 
 #include "pico/cyw43_arch.h"
@@ -36,65 +37,173 @@ void GPS_gpsd::Initialize()
 
     // Initialize the queue for received sentences. This uses the SDK queue_t structure for thread-safe access.
     queue_init(&m_qSentences, GPS_BUFSIZE, GPS_QUEUE_SIZE); // Initialize the queue for received sentences
+    m_errorSleepMs = GPSD_ERROR_SLEEP_INITIAL_MS;
+}
 
-    LogInfo("Connecting to Wi-Fi");
-    cyw43_arch_enable_sta_mode();
-    cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM & ~0xf);
-    // while (cyw43_arch_wifi_connect_timeout_ms(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK, 5000))
-    // {
-    //     LogInfo("Failed to connect to Wi-Fi; retrying");
-    //     cyw43_arch_poll();
-    // }
-    bool bConnected = false;
-    while (!bConnected)
+bool GPS_gpsd::wifiStateMachine()
+{
+    // Poll the lwip stack
+    cyw43_arch_poll();
+
+    err_t err = ERR_OK;
+    switch (m_wifiState)
     {
+    case WifiState::DISCONNECTED:
+        // Attempt to connect
+        LogInfo("Wifi disconnected, initializing connection");
+        cyw43_arch_enable_sta_mode();
+        cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM & ~0xf);
+        SetWifiState(WifiState::CONNECTING);
         std::cout << "Calling cyw43_arch_wifi_connect_async" << std::endl;
         cyw43_arch_wifi_connect_async(g_szWifiSsid, g_szWifiPassword, CYW43_AUTH_WPA2_AES_PSK);
-        absolute_time_t timeout = make_timeout_time_ms(5000);
-        while (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
+        m_wifiConnectTimeout = make_timeout_time_ms(5000);
+        return false;
+
+    case WifiState::CONNECTING:
+        if (CYW43_LINK_UP == cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA))
         {
-            cyw43_arch_poll();
-            sleep_ms(10);
-            if (absolute_time_diff_us(get_absolute_time(), timeout) < 0)
+            LogInfo("Wifi connected successfully");
+            SetWifiState(WifiState::CONNECTED);
+            return false;
+        }
+        if (CYW43_LINK_BADAUTH == cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA))
+        {
+            LogInfo("Wifi authentication failed");
+            SetWifiState(WifiState::DISCONNECTED);
+            return false;
+        }
+        sleep_ms(10);
+        if (absolute_time_diff_us(get_absolute_time(), m_wifiConnectTimeout) < 0)
+        {
+            // Handle timeout error
+            cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+            sleep_ms(500);
+            std::cout << "Failed to connect to Wifi; retrying" << std::endl;
+            SetWifiState(WifiState::DISCONNECTED);
+        }
+        return false;
+
+    case WifiState::CONNECTED:
+        switch (m_gpsdServerState)
+        {
+        case GpsdServerState::DISCONNECTED:
+            ip4addr_aton(g_szGpsdIpAddress, &m_remoteAddr);
+            std::cout << "Preparing connection to " << ip4addr_ntoa(&m_remoteAddr) << " port " << g_nGpsdTcpPort << std::endl;
+            m_pTcpPcb = tcp_new_ip_type(IP_GET_TYPE(m_remoteAddr));
+            if (m_pTcpPcb == nullptr)
             {
-                // Handle timeout error
-                std::cout << "Failed to connect to Wi-Fi; retrying" << std::endl;
-                break;
+                LogInfo("Unable to allocate TCP control block for gpsd");
+                panic("Unable to allocate TCP control block for gpsd");
+                return false;
             }
+            tcp_arg(m_pTcpPcb, this);
+            tcp_poll(m_pTcpPcb, tcpPoll, pollTimeSeconds * 2);
+            tcp_sent(m_pTcpPcb, tcpSent);
+            tcp_recv(m_pTcpPcb, tcpRecv);
+            tcp_err(m_pTcpPcb, tcpError);
+            tcp_nagle_disable(m_pTcpPcb);
+            SetServerState(GpsdServerState::CONNECTING);
+            return false;
+
+        case GpsdServerState::CONNECTING:
+            LogInfo("Attempting to connect to gpsd server");
+            cyw43_arch_lwip_begin();
+            err = tcp_connect(m_pTcpPcb, &m_remoteAddr, g_nGpsdTcpPort, tcpConnected);
+            cyw43_arch_lwip_end();
+            if (err != ERR_OK)
+            {
+                LogInfo("Error connecting to gpsd: " + std::to_string(err));
+                LogInfo("Setting GPSD server state to ERROR");
+                SetServerState(GpsdServerState::ERROR);
+                return false;
+            }
+            LogInfo("Waiting for tcp_connect result");
+            SetServerState(GpsdServerState::WAITING_FOR_CONNECT_RESULT);
+            return false;
+
+        case GpsdServerState::WAITING_FOR_CONNECT_RESULT:
+            return false;
+
+        case GpsdServerState::CONNECTION_SUCCEEDED:
+            LogInfo("Sending watch command: " + std::string(gpsdWatchCommand));
+            writeString(gpsdWatchCommand);
+            SetServerState(GpsdServerState::CONNECTED);
+            m_errorSleepMs = GPSD_ERROR_SLEEP_INITIAL_MS;
+            return true;
+
+        case GpsdServerState::CONNECTED:
+            return true;
+
+        case GpsdServerState::ERROR:
+            LogInfo("Gpsd server connection error");
+            // A lapse in data reception has occurred, indicating a potential connection issue
+            closeConnection();
+            sleep_ms(m_errorSleepMs); // Wait before attempting to reconnect
+            m_errorSleepMs = std::min(m_errorSleepMs + GPSD_ERROR_SLEEP_STEP_MS, GPSD_ERROR_SLEEP_MAX_MS);
+            if (CYW43_LINK_UP == cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA))
+            {
+                // If the link is still up, reset the server connection
+                SetServerState(GpsdServerState::DISCONNECTED);
+            }
+            else
+            {
+                // If the link is down, mark the Wi-Fi as disconnected
+                cyw43_arch_disable_sta_mode();
+                SetServerState(GpsdServerState::DISCONNECTED);
+                SetWifiState(WifiState::DISCONNECTED);
+            }
+            return false;
+
+        default:
+            return false;
         }
-        std::cout << "Calling cyw43_tcpip_link_status" << std::endl;
-        if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP)
+    default:
+        return false;
+    }
+    return false;
+}
+
+// Get a sentence from the queue. This function will return false if no sentence is available.
+bool GPS_gpsd::getSentence(std::string& strSentence)
+{
+    if (!wifiStateMachine())
+    {
+        return false;
+    }
+
+    // Drain any bytes written to the circular buffer since our last pass.
+    size_t nWritePos = m_iRingWritePos;
+    size_t nReadPos = m_iRingReadPos;
+
+    if (nWritePos != nReadPos)
+    {
+        if (nWritePos > nReadPos)
         {
-            bConnected = true;
+            // Contiguous region: read [readPos, writePos)
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, nWritePos - nReadPos);
+        }
+        else
+        {
+            // Wrapped: read [readPos, end) then [0, writePos)
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, GPS_RING_BUFSIZE - nReadPos);
+            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf), nWritePos);
+        }
+        m_iRingReadPos = nWritePos;
+    }
+
+    bool bFound = false;
+
+    // Check if there are any sentences in the queue. If so, remove one and return it.
+    if (queue_try_peek(&m_qSentences, nullptr))
+    {
+        char szBuffer[GPS_BUFSIZE];
+        if (queue_try_remove(&m_qSentences, szBuffer))
+        {
+            strSentence = std::string(szBuffer);
+            bFound = true;
         }
     }
-    LogInfo("Connected to Wi-Fi");
-
-    ip4addr_aton(g_szGpsdIpAddress, &m_remoteAddr);
-    std::cout << "Connecting to " << ip4addr_ntoa(&m_remoteAddr) << " port " << g_nGpsdTcpPort << std::endl;
-    m_pTcpPcb = tcp_new_ip_type(IP_GET_TYPE(m_remoteAddr));
-    if (m_pTcpPcb == nullptr)
-    {
-        LogInfo("Unable to allocate TCP control block for gpsd");
-        Stop();
-        return;
-    }
-
-    tcp_arg(m_pTcpPcb, this);
-    tcp_poll(m_pTcpPcb, tcpPoll, pollTimeSeconds * 2);
-    tcp_sent(m_pTcpPcb, tcpSent);
-    tcp_recv(m_pTcpPcb, tcpRecv);
-    tcp_err(m_pTcpPcb, tcpError);
-    tcp_nagle_disable(m_pTcpPcb);
-
-    cyw43_arch_lwip_begin();
-    err_t err = tcp_connect(m_pTcpPcb, &m_remoteAddr, g_nGpsdTcpPort, tcpConnected);
-    cyw43_arch_lwip_end();
-    if (err != ERR_OK)
-    {
-        std::cout << "Error connecting to gpsd: " << err << std::endl;
-        Stop();
-    }
+    return bFound;
 }
 
 void GPS_gpsd::closeConnection()
@@ -114,6 +223,8 @@ void GPS_gpsd::closeConnection()
         tcp_abort(m_pTcpPcb);
     }
     m_pTcpPcb = nullptr;
+
+    sleep_ms(1000); // Wait for a moment to ensure the connection is properly closed.
 }
 
 void GPS_gpsd::writeString(const std::string& str)
@@ -123,7 +234,7 @@ void GPS_gpsd::writeString(const std::string& str)
     cyw43_arch_lwip_end();
     if (err != ERR_OK)
     {
-        std::cout << "lwIP tcp_write error " << err << std::endl;
+        std::cout << "lwIP tcp_write error " << std::to_string(err) << std::endl;
     }
 }
 
@@ -156,13 +267,14 @@ err_t GPS_gpsd::onTcpConnected(struct tcp_pcb* pcb, err_t err)
 {
     if (err != ERR_OK)
     {
-        std::cout << "gpsd connection error " << err << std::endl;
-        Stop();
+        // Unsuccessful, set error in order to retry
+        LogInfo("gpsd connection error " + std::to_string(err));
+        LogInfo("Setting GPSD server state to ERROR");
+        SetServerState(GpsdServerState::ERROR);
         return ERR_OK;
     }
-
-    LogInfo("Sending watch command: " + std::string(gpsdWatchCommand));
-    writeString(gpsdWatchCommand);
+    LogInfo("GPSD server connection established successfully.");
+    SetServerState(GpsdServerState::CONNECTION_SUCCEEDED);
     return ERR_OK;
 }
 
@@ -181,8 +293,9 @@ err_t GPS_gpsd::onTcpRecv(struct tcp_pcb* pcb, struct pbuf* p, err_t err)
     cyw43_arch_lwip_check();
     if (p == nullptr)
     {
-        LogInfo("Received null pbuf, stopping GPS.");
-        Stop();
+        LogInfo("Received null pbuf.");
+        LogInfo("Setting GPSD server state to ERROR");
+        SetServerState(GpsdServerState::ERROR);
         return ERR_OK;
     }
 
@@ -198,6 +311,14 @@ err_t GPS_gpsd::onTcpRecv(struct tcp_pcb* pcb, struct pbuf* p, err_t err)
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     return ERR_OK;
+}
+
+void GPS_gpsd::onTcpError(err_t err)
+{
+    m_pTcpPcb = nullptr;
+    LogInfo("gpsd TCP error " + std::to_string(err));
+    LogInfo("Setting GPSD server state to ERROR");
+    SetServerState(GpsdServerState::ERROR);
 }
 
 // Feed received bytes into the sentence assembly buffer. Completed sentences are queued for the main loop.
@@ -238,50 +359,40 @@ void GPS_gpsd::processRingBytes(const uint8_t* pBuf, size_t nLen)
     }
 }
 
-void GPS_gpsd::onTcpError(err_t err)
+std::string GPS_gpsd::WifiStateToString(WifiState state)
 {
-    m_pTcpPcb = nullptr;
-    std::cout << "gpsd TCP error " << err << std::endl;
-    Stop();
+    switch (state)
+    {
+    case WifiState::DISCONNECTED:
+        return "DISCONNECTED";
+    case WifiState::CONNECTING:
+        return "CONNECTING";
+    case WifiState::CONNECTED:
+        return "CONNECTED";
+    case WifiState::ERROR:
+        return "ERROR";
+    default:
+        return "UNKNOWN";
+    }
 }
 
-// Get a sentence from the queue. This function will return false if no sentence is available.
-bool GPS_gpsd::getSentence(std::string& strSentence)
+std::string GPS_gpsd::GpsdServerStateToString(GpsdServerState state)
 {
-    // Poll the lwip stack
-    cyw43_arch_poll();
-
-    // Drain any bytes written to the circular buffer since our last pass.
-    size_t nWritePos = m_iRingWritePos;
-    size_t nReadPos = m_iRingReadPos;
-
-    if (nWritePos != nReadPos)
+    switch (state)
     {
-        if (nWritePos > nReadPos)
-        {
-            // Contiguous region: read [readPos, writePos)
-            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, nWritePos - nReadPos);
-        }
-        else
-        {
-            // Wrapped: read [readPos, end) then [0, writePos)
-            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf) + nReadPos, GPS_RING_BUFSIZE - nReadPos);
-            processRingBytes(reinterpret_cast<const uint8_t*>(m_szRingBuf), nWritePos);
-        }
-        m_iRingReadPos = nWritePos;
+    case GpsdServerState::DISCONNECTED:
+        return "DISCONNECTED";
+    case GpsdServerState::CONNECTING:
+        return "CONNECTING";
+    case GpsdServerState::WAITING_FOR_CONNECT_RESULT:
+        return "WAITING_FOR_CONNECT_RESULT";
+    case GpsdServerState::CONNECTION_SUCCEEDED:
+        return "CONNECTION_SUCCEEDED";
+    case GpsdServerState::CONNECTED:
+        return "CONNECTED";
+    case GpsdServerState::ERROR:
+        return "ERROR";
+    default:
+        return "UNKNOWN";
     }
-
-    bool bFound = false;
-
-    // Check if there are any sentences in the queue. If so, remove one and return it.
-    if (queue_try_peek(&m_qSentences, nullptr))
-    {
-        char szBuffer[GPS_BUFSIZE];
-        if (queue_try_remove(&m_qSentences, szBuffer))
-        {
-            strSentence = std::string(szBuffer);
-            bFound = true;
-        }
-    }
-    return bFound;
 }

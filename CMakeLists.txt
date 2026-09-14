@@ -64,6 +64,9 @@ add_compile_definitions(USE_DST=AUTOMATIC)
 # Legacy fallback for simple numeric offsets
 add_compile_definitions(GMT_OFFSET=-4.0)
 
+# Enable display of vsys voltage and power source. Note: incorrect on Pico 2 (non-W variant)
+add_compile_definitions(DISPLAY_VSYS_VOLTAGE)
+
 # Set pico platform definitions for conditional compilation
 if(PICO_BOARD STREQUAL pico_w OR PICO_BOARD STREQUAL pico2_w)
     add_compile_definitions(PLATFORM_PICO_W)
