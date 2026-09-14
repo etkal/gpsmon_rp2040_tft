@@ -42,6 +42,7 @@ public:
 
 private:
     static void gpsDataCB(void* pCtx, GPSData::Shared spGPSData);
+    static void messageCB(void* pCtx, std::string strMessage);
 
     // Hand a GPSData::Shared across a pico queue_t via a heap-allocated shared_ptr wrapper,
     // so the underlying object's lifetime is managed safely (and only) via reference counting.
@@ -49,7 +50,7 @@ private:
     // Drain a queue of heap-allocated shared_ptr wrappers, keeping only the most recent GPSData.
     static GPSData::Shared dequeueLatestGPSData(queue_t& q);
 
-    void showWaitingForGPS();
+    void showScreenMessage(std::string strMessage);
     void blinkLED(bool bHasPosition, bool bExternalAntenna);
     void updateTime(std::string strGPSTimeRaw, std::string strGPSDateRaw);
     std::string getVsysVoltage();

@@ -46,11 +46,16 @@ bool GPS_gpsd::wifiStateMachine()
     cyw43_arch_poll();
 
     err_t err = ERR_OK;
+    int linkStatus;
     switch (m_wifiState)
     {
     case WifiState::DISCONNECTED:
         // Attempt to connect
         LogInfo("Wifi disconnected, initializing connection");
+        if (m_pMessageCallback)
+        {
+            m_pMessageCallback(m_pMessageCtx, "Initiating wifi connect");
+        }
         cyw43_arch_enable_sta_mode();
         cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM & ~0xf);
         SetWifiState(WifiState::CONNECTING);
@@ -60,15 +65,21 @@ bool GPS_gpsd::wifiStateMachine()
         return false;
 
     case WifiState::CONNECTING:
-        if (CYW43_LINK_UP == cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA))
+        linkStatus = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+        if (CYW43_LINK_UP == linkStatus)
         {
             LogInfo("Wifi connected successfully");
             SetWifiState(WifiState::CONNECTED);
             return false;
         }
-        if (CYW43_LINK_BADAUTH == cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA))
+        if (linkStatus < 0)
         {
-            LogInfo("Wifi authentication failed");
+            LogInfo("Wifi connection failed");
+            if (m_pMessageCallback)
+            {
+                m_pMessageCallback(m_pMessageCtx, "Wifi connection failed");
+            }
+            sleep_ms(10000);
             SetWifiState(WifiState::DISCONNECTED);
             return false;
         }
@@ -107,6 +118,10 @@ bool GPS_gpsd::wifiStateMachine()
 
         case GpsdServerState::CONNECTING:
             LogInfo("Attempting to connect to gpsd server");
+            if (m_pMessageCallback)
+            {
+                m_pMessageCallback(m_pMessageCtx, "Connecting to server");
+            }
             cyw43_arch_lwip_begin();
             err = tcp_connect(m_pTcpPcb, &m_remoteAddr, g_nGpsdTcpPort, tcpConnected);
             cyw43_arch_lwip_end();

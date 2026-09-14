@@ -92,9 +92,10 @@ void GPS_TFT::Initialize()
     // Initialize display
     m_spDisplay->SetFont(get_recommended_font(nFontSize));
 
-    showWaitingForGPS();
+    showScreenMessage("Waiting for GPS data");
 
     m_spGPS->SetGpsDataCallback(this, gpsDataCB);
+    m_spGPS->SetMessageCallback(this, messageCB);
 
     m_spIdleTimer = std::make_shared<AlarmTimer>([this]() {
         m_bShowWaitingForGPS = true;
@@ -127,7 +128,6 @@ void GPS_TFT::Run()
         {
             multicore_fifo_pop_blocking(); // Wait for signal from core 0
             GPSData::Shared spGPSData = dequeueLatestGPSData(pThis->m_qDisplayGPSData);
-            std::cout << "Updating UI with GPSData at " << spGPSData.get() << std::endl;
             if (spGPSData)
             {
                 pThis->updateUI(spGPSData);
@@ -147,7 +147,6 @@ void GPS_TFT::Run()
 
         if (spGPSData)
         {
-            std::cout << "Received new GPSData at " << spGPSData.get() << std::endl;
             LogInfo("GPS_TFT - Processing new GPS data");
             // Perform operations that need to run on core 0 (main core)
             blinkLED(spGPSData->bHasPosition, spGPSData->bExternalAntenna);
@@ -167,7 +166,7 @@ void GPS_TFT::Run()
         if (m_bShowWaitingForGPS)
         {
             LogInfo("GPS_TFT - No GPS data received showing waiting message");
-            showWaitingForGPS();
+            showScreenMessage("Waiting for GPS data");
             m_bShowWaitingForGPS = false;
         }
     }
@@ -218,12 +217,25 @@ void GPS_TFT::gpsDataCB(void* pCtx, GPSData::Shared spGPSData)
     enqueueGPSData(pThis->m_qIncomingGPSData, std::make_shared<GPSData>(*spGPSData));
 }
 
-void GPS_TFT::showWaitingForGPS()
+void GPS_TFT::messageCB(void* pCtx, std::string strMessage)
+{
+    LogInfo("GPS_TFT - received message: " + strMessage);
+    GPS_TFT* pThis = reinterpret_cast<GPS_TFT*>(pCtx);
+    if (nullptr == pThis)
+    {
+        LogInfo("messageCB: pCtx is null");
+        return;
+    }
+
+    pThis->showScreenMessage(strMessage);
+}
+
+void GPS_TFT::showScreenMessage(std::string strMessage)
 {
     m_spDisplay->Clear(COLOUR_BLACK);
     auto nQuadrant = m_spDisplay->GetQuadrants().front();
     m_spDisplay->SetQuadrant(nQuadrant);
-    drawText(0, "Waiting for GPS data", COLOUR_RED, false, 0);
+    drawText(0, strMessage, COLOUR_RED, false, 0);
     m_spDisplay->Show();
 }
 
