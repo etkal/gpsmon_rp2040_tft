@@ -99,6 +99,13 @@ void GPS::SetGpsDataCallback(void* pCtx, gpsDataCallback pCB)
     m_pGpsDataCallback = pCB;
 }
 
+// Set the callback for a text message, e.g., for displaying status or error messages.
+void GPS::SetMessageCallback(void* pCtx, messageCallback pCB)
+{
+    m_pMessageCtx = pCtx;
+    m_pMessageCallback = pCB;
+}
+
 void GPS::Initialize()
 {
     // If we are on core 1 we need to ensure timers fire on that core.
@@ -130,7 +137,7 @@ void GPS::Initialize()
     // we will clear the GPS data object so as to invalidate position information, etc.
     m_spIdleTimer = std::make_shared<AlarmTimer>(
         [this]() {
-            LogInfo("GPS - No GPS data received, clearing GPS data");
+            // LogInfo("GPS - No GPS data received, clearing GPS data");
             m_spGPSData.reset();
         },
         m_pAlarmPool);

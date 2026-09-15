@@ -34,6 +34,10 @@
 #include "timemgr.h"
 #include "network_info.h"
 
+#if defined(GPS_ON_CORE_1) && defined(DISPLAY_ON_CORE_1)
+#error "GPS_ON_CORE_1 and DISPLAY_ON_CORE_1 cannot both be defined"
+#endif
+
 #if defined(DISPLAY_PICO_RESTOUCH) // Waveshare Pico-ResTouch-LCD-3.5
 #define SPI_DEVICE spi1
 #define PIN_DC     8
@@ -103,7 +107,16 @@ int main()
     adc_init();
 
 #if !defined(NDEBUG)
+    timer_hw->dbgpause = 0;
     sleep_ms(5000);
+#endif
+
+#if defined(PLATFORM_PICO_W)
+    if (cyw43_arch_init())
+    {
+        std::cout << "Failed to initialize cyw43 hardware" << std::endl;
+        return 1;
+    }
 #endif
 
     TimeMgr::InitializeSingleton(TIME_ZONE);
@@ -115,12 +128,6 @@ int main()
     LED_pico ledGreen(16); // green
     LED_pico ledRed(17);   // red
 #endif
-
-    if (cyw43_arch_init())
-    {
-        std::cout << "Failed to initialize wifi hardware" << std::endl;
-        return 1;
-    }
 
     // Create the LED object
     LED::Shared spLED;
@@ -266,6 +273,5 @@ void SplashDemo(ILI_TFT::Shared spDisplay)
         spDisplay->Show();
     }
     sleep_ms(2000);
-    spDisplay->Clear(COLOUR_BLACK);
 }
 #endif

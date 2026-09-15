@@ -22,12 +22,16 @@ set(PICO_BOARD pico_w)
 #set(PICO_BOARD waveshare_rp2040_zero)
 #set(PICO_BOARD seeed_xiao_rp2040)
 
-# The following should not be enabled for wifi as the wifi stack uses the primary core.
-#add_compile_definitions(USE_MULTICORE) # Enable multicore support for the RP2040
+# Run the GPS processing on the second core if desired. The gpsmon implementation cannot
+# utilize this as the wifi stack uses the primary core.
+#add_compile_definitions(GPS_ON_CORE_1)
+
+# Run the display on the second core. Alternative for the above.
+add_compile_definitions(DISPLAY_ON_CORE_1)
 
 # GPS data callback delay (in milliseconds). On some hardware this is necessary in order to
 # keep the display update from interfering with the received data (even if on another core).
-add_compile_definitions(GPS_SEND_DATA_DELAY_MS=400)
+add_compile_definitions(GPS_SEND_DATA_DELAY_MS=0)
 
 # TFT display type - enable one of the following
 #
@@ -60,6 +64,9 @@ add_compile_definitions(USE_DST=AUTOMATIC)
 # Legacy fallback for simple numeric offsets
 add_compile_definitions(GMT_OFFSET=-4.0)
 
+# Enable display of vsys voltage and power source. Note: incorrect on Pico 2 (non-W variant)
+add_compile_definitions(DISPLAY_VSYS_VOLTAGE)
+
 # Set pico platform definitions for conditional compilation
 if(PICO_BOARD STREQUAL pico_w OR PICO_BOARD STREQUAL pico2_w)
     add_compile_definitions(PLATFORM_PICO_W)
@@ -88,7 +95,6 @@ add_compile_options(-Wall
     -Wno-maybe-uninitialized
 )
 
-
 # Power status
 add_library(power_status_adc INTERFACE)
 target_sources(power_status_adc INTERFACE
@@ -101,7 +107,6 @@ target_link_libraries(power_status_adc INTERFACE
     hardware_adc
     hardware_gpio
 )
-
 
 add_executable(gpsmon_tft)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
@@ -135,7 +140,7 @@ target_link_libraries(gpsmon_tft
 )
 if(PICO_BOARD STREQUAL pico_w OR PICO_BOARD STREQUAL pico2_w)
     target_link_libraries(gpsmon_tft
-        pico_cyw43_arch_lwip_threadsafe_background
+        pico_cyw43_arch_lwip_poll
     )
 endif()
 
