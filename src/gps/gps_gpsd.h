@@ -15,20 +15,15 @@
 #include "pico/sync.h"
 #include "pico/util/queue.h"
 
+#include "wifi.h"
+#include "log.h"
+
 auto constexpr GPS_BUFSIZE = 256;       // Max NMEA-0183 sentence length is actually 82 characters
 auto constexpr GPS_QUEUE_SIZE = 16;     // Number of sentences to queue
 auto constexpr GPS_RING_BUFSIZE = 4096; // Circular ring buffer size
-constexpr uint32_t GPSD_ERROR_SLEEP_INITIAL_MS = 2000;
-constexpr uint32_t GPSD_ERROR_SLEEP_STEP_MS = 2000;
-constexpr uint32_t GPSD_ERROR_SLEEP_MAX_MS = 10000;
-
-enum class WifiState
-{
-    DISCONNECTED,
-    CONNECTING,
-    CONNECTED,
-    ERROR
-};
+constexpr uint32_t GPSD_CONNECT_DELAY_INITIAL_MS = 2000;
+constexpr uint32_t GPSD_CONNECT_DELAY_STEP_MS = 2000;
+constexpr uint32_t GPSD_CONNECT_DELAY_MAX_MS = 10000;
 
 enum class GpsdServerState
 {
@@ -51,17 +46,12 @@ public:
     void Initialize() override;
 
 private:
-    bool wifiStateMachine();
-    void SetWifiState(WifiState state)
-    {
-        auto current = m_wifiState;
-        LogInfo("Wifi state " + WifiStateToString(current) + " -> " + WifiStateToString(state));
-        m_wifiState = state;
-    }
-    void SetServerState(GpsdServerState state)
+    static void wifiStateCallback(void* pCtx, const WifiState state);
+    bool serverStateMachine();
+    void setServerState(GpsdServerState state)
     {
         auto current = m_gpsdServerState;
-        LogInfo("GPSD server state " + GpsdServerStateToString(current) + " -> " + GpsdServerStateToString(state));
+        LogInfo("GPSD server state " + gpsdServerStateToString(current) + " -> " + gpsdServerStateToString(state));
         m_gpsdServerState = state;
     }
 
@@ -81,13 +71,19 @@ private:
     err_t onTcpRecv(struct tcp_pcb* pcb, struct pbuf* p, err_t err);
     void onTcpError(err_t err);
 
-    // Wifi and server state
-    static std::string WifiStateToString(WifiState state);
-    static std::string GpsdServerStateToString(GpsdServerState state);
-
-    WifiState m_wifiState {WifiState::DISCONNECTED};
+    // Server state
+    static std::string gpsdServerStateToString(GpsdServerState state);
     GpsdServerState m_gpsdServerState {GpsdServerState::DISCONNECTED};
-    uint32_t m_errorSleepMs {GPSD_ERROR_SLEEP_INITIAL_MS};
+
+    AlarmTimer::Shared m_spReconnectTimer; // Timer to allow connect attempt
+    uint32_t m_connectDelayMs {GPSD_CONNECT_DELAY_INITIAL_MS};
+    bool m_bReadyToConnect {false};
+    bool m_bWifiConnected {false};
+    err_t m_lastTcpError {ERR_OK};
+
+    bool m_bTcpConnectFailed {false};
+    bool m_bTcpConnectSucceeded {false};
+    bool m_bTcpError {false};
 
     // TCP RX management
     struct tcp_pcb* m_pTcpPcb {nullptr};
