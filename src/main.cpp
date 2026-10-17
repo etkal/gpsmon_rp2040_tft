@@ -21,17 +21,26 @@
  */
 
 #include <iostream>
+#include <limits>
 
 #include "pico/stdlib.h"
-#include "hardware/adc.h"
+
 #if defined(PLATFORM_PICO_W)
 #include "pico/cyw43_arch.h"
 #endif
 
-#include "gps_gpsd.h"
+// This implementation uses an TFT display and GPSD-based GPS device
+#include "ili_tft.h"
 #include "gps_tft.h"
-#include "font_factory.h"
+#include "gps_gpsd.h"
+
+#include "led.h"
+#include "button.h"
 #include "timemgr.h"
+#include "wifi.h"
+#include "powermgr.h"
+#include "log.h"
+
 #include "network_info.h"
 
 #if defined(GPS_ON_CORE_1) && defined(DISPLAY_ON_CORE_1)
@@ -80,11 +89,30 @@
 #error unknown board
 #endif
 
-// #define USE_WS2812_PIN 12 // Override
+// #define USE_WS2812_PIN 16 // Override
 // #define USE_LED_PIN 16    // Override
 
-#if !defined(DISPLAY_SPI_SPEED)
-#define DISPLAY_SPI_SPEED 20000000 // 20MHz
+// GPIO pin for a button
+#define PIN_BUTTON 6
+
+namespace
+{
+    constexpr uint64_t timeSyncRetryIntervalSec = 5 * 60;
+} // namespace
+
+#if !defined(NDEBUG)
+// Used in debug builds to check for memory leaks
+#include <malloc.h>
+static uint32_t getTotalHeap()
+{
+    extern char __StackLimit, __bss_end__;
+    return &__StackLimit - &__bss_end__;
+}
+static uint32_t getFreeHeap()
+{
+    struct mallinfo m = mallinfo();
+    return getTotalHeap() - m.uordblks;
+}
 #endif
 
 extern "C"
@@ -97,19 +125,18 @@ extern "C"
     }
 }
 
-#if !defined(NDEBUG)
-void SplashDemo(ILI_TFT::Shared spDisplay);
-#endif
-
 int main()
 {
-    stdio_init_all();
-    adc_init();
+#if !defined(PICO_DEBUGPROBE)
+    stdio_usb_init();
+#else
+    stdio_init_all(); // Use this for debugprobe
+#endif
 
 #if !defined(NDEBUG)
     timer_hw->dbgpause = 0;
-    sleep_ms(5000);
 #endif
+    sleep_ms(1000);
 
 #if defined(PLATFORM_PICO_W)
     if (cyw43_arch_init())
@@ -119,8 +146,29 @@ int main()
     }
 #endif
 
+    LogInfo("Starting GPS application...");
+
     TimeMgr::InitializeSingleton(TIME_ZONE);
-    LogInfo("Starting GPS TFT application...");
+
+#if TIME_SYNC_USE_NTP
+    LogInfo("Initializing Wifi connection object...");
+    // Wifi connection is driven asynchronously from the main loop; NTP sync is gated on it being up.
+    WifiConnection::InitializeSingleton(g_szWifiSsid, g_szWifiPassword);
+#endif
+    WifiConnection::Shared spWifi = WifiConnection::GetInstance();
+    if (spWifi)
+    {
+        spWifi->Enable();
+    }
+
+    #if defined(DISPLAY_VSYS_VOLTAGE)
+#if defined(ADC_GPIO_PIN)
+    PowerMgr::InitializeSingleton(ADC_GPIO_PIN); // Initialize the power manager with the specified ADC GPIO pin
+#elif defined(PICO_VSYS_PIN)
+    PowerMgr::InitializeSingleton(PICO_VSYS_PIN); // Initialize the power manager with the VSYS pin
+#endif
+#endif // DISPLAY_VSYS_VOLTAGE
+    auto spPowerMgr = PowerMgr::GetInstance();
 
 #if defined(SEEED_XIAO_RP2040)
     // Clear LED(s) on XIAO (default on)
@@ -153,11 +201,19 @@ int main()
     spLED->SetIgnore({led_red, led_magenta});
 #endif
 
-    LogInfo("Creating GPS object...");
+    // Create the button object
+    Button::Shared spButton;
+#if defined(PIN_BUTTON)
+    spButton = std::make_shared<Button>(PIN_BUTTON);
+    spButton->Initialize();
+#endif
+
+    LogInfo("Creating GPS objects...");
+
     // Create the GPS object
     GPS_gpsd::Shared spGPS = std::make_shared<GPS_gpsd>();
 
-    LogInfo("Creating display object...");
+    LogInfo("Creating display objects...");
     // Create the display. ILI9341 or ILI9488, rotate 270 degrees for landscape.
 #if defined(DISPLAY_ILI934X)
     ILI934X::Shared spDisplay =
@@ -171,25 +227,100 @@ int main()
 #else
 #error Unsupported display specified
 #endif
+    // Create the GPS_TFT display object
+    GPS_TFT::Shared spDevice = std::make_shared<GPS_TFT>(spDisplay, spGPS, spButton);
 
-    LogInfo("Initializing display object...");
-    spDisplay->Initialize();
-    LogInfo("Clearing display...");
-    spDisplay->Clear(COLOUR_BLACK);
+    // Start the GPS acquisition, might be local or on core 1
+    spGPS->Start();
+    // Start the GPSDisplay device
+    spDevice->Start();
+
+    uint64_t nLastTimeSyncAttemptSec = std::numeric_limits<uint64_t>::max();
+    GPS_Status deviceStatus;
+    uint64_t prevNowSecond = TimeMgr::CurrentEpochSeconds();
+
+    while (true)
+    {
+        // Perform any main loop work for the WiFi module
+        spWifi->DoWork();
+
+        if (spLED)
+        {
+            spLED->DoWork(); // Handle any outstanding work (e.g. turn off blink)
+        }
+
+        spGPS->DoWork(); // Process the GPS
+
+        spDevice->DoWork(); // Process the GPSDisplay (noop if it is autonomous on core 1)
+
+        // Check if the device has received new data, limits the frequency of time synchronization attempts, etc.
+        if (spDevice->GetStatus(deviceStatus))
+        {
+            // Update the system time if necessary
+            if (!deviceStatus.strGpsTimeRaw.empty() && !deviceStatus.strGpsDateRaw.empty())
+            {
+                const uint64_t uptimeSec = time_us_64() / 1000000;
+                const bool bNeverRetried = (nLastTimeSyncAttemptSec == std::numeric_limits<uint64_t>::max());
+                const bool bUpdateDue = !TimeMgr::IsWallClockValid() || bNeverRetried ||
+                                        (uptimeSec - nLastTimeSyncAttemptSec >= timeSyncRetryIntervalSec); // ||
+                // !TimeMgr::IsGpsTimeDateWithinOneSecond(strGPSTimeRaw, strGPSDateRaw);
+                if (bUpdateDue)
+                {
+                    nLastTimeSyncAttemptSec = uptimeSec;
+                    LogInfo("Attempting GPS time sync");
+                    if (TimeMgr::SetTimeFromGps(deviceStatus.strGpsTimeRaw, deviceStatus.strGpsDateRaw))
+                    {
+                        LogInfo("GPS time synchronized");
+                    }
+                }
+            }
+        }
+
+        // Perform actions you want to occur once per second
+        uint64_t nowSecond = TimeMgr::CurrentEpochSeconds();
+        if (nowSecond != prevNowSecond)
+        {
+            prevNowSecond = nowSecond;
+
+            // Set or blink the LED here based on the device status.
+            if (spLED)
+            {
+                if (deviceStatus.strGpsTimeRaw.empty())
+                {
+                    spLED->SetPixel(0, led_red);
+                    spLED->Blink_ms(0, 500);
+                }
+                else
+                {
+                    if (deviceStatus.bHasPosition)
+                    {
+                        spLED->SetPixel(0, deviceStatus.bExternalAntenna ? led_blue : led_green);
+                    }
+                    else
+                    {
+                        spLED->SetPixel(0, deviceStatus.bExternalAntenna ? led_magenta : led_red);
+                    }
+                    spLED->Blink_ms(0, 50);
+                }
+            }
+
+            // If configured, check the power source voltage and status.
+            if (spPowerMgr)
+            {
+                auto fVoltage = spPowerMgr->GetVoltage(true);
+                auto bUsingBattery = spPowerMgr->UsingBattery();
+
+                if (0.0f != fVoltage)
+                {
+                    LogInfoD("Battery Voltage: " + std::to_string(fVoltage) + "  Using Battery: " + std::to_string(bUsingBattery));
+                }
+            }
 
 #if !defined(NDEBUG)
-    LogInfo("Showing splash demo...");
-    SplashDemo(spDisplay);
-    spDisplay->Clear(COLOUR_BLACK);
+            LogInfo("Total Heap: " + std::to_string(getTotalHeap()) + "  Free Heap: " + std::to_string(getFreeHeap()));
 #endif
-
-    // Create the GPS_TFT display object
-    GPS_TFT::Shared spDevice = std::make_shared<GPS_TFT>(spDisplay, spGPS, spLED);
-
-    spDevice->Initialize();
-
-    // Run the show
-    spDevice->Run();
+        }
+    }
 
 #if defined(PLATFORM_PICO_W)
     cyw43_arch_deinit();
@@ -198,80 +329,3 @@ int main()
     LogInfo("Exiting...");
     return 0;
 }
-
-#if !defined(NDEBUG)
-void SplashDemo(ILI_TFT::Shared spDisplay)
-{
-    // Palette demo splash: show all 16 named RGB565 colors with labels
-    struct NamedColour
-    {
-        const char* name;
-        const char* hex;
-        uint16_t value;
-    };
-
-    static const NamedColour colours[16] = {
-        {"BLACK",   "0x0000", COLOUR_BLACK  },
-        {"MAROON",  "0x8000", COLOUR_MAROON },
-        {"GREEN",   "0x0400", COLOUR_GREEN  },
-        {"OLIVE",   "0x8400", COLOUR_OLIVE  },
-        {"NAVY",    "0x0010", COLOUR_NAVY   },
-        {"PURPLE",  "0x8010", COLOUR_PURPLE },
-        {"TEAL",    "0x0410", COLOUR_TEAL   },
-        {"SILVER",  "0xC618", COLOUR_SILVER },
-        {"GRAY",    "0x8410", COLOUR_GRAY   },
-        {"RED",     "0xF800", COLOUR_RED    },
-        {"LIME",    "0x07E0", COLOUR_LIME   },
-        {"YELLOW",  "0xFFE0", COLOUR_YELLOW },
-        {"BLUE",    "0x001F", COLOUR_BLUE   },
-        {"FUCHSIA", "0xF81F", COLOUR_FUCHSIA},
-        {"AQUA",    "0x07FF", COLOUR_AQUA   },
-        {"WHITE",   "0xFFFF", COLOUR_WHITE  },
-    };
-
-    auto text_colour_for_bg = [](uint16_t c) -> uint16_t {
-        uint8_t r5 = (c >> 11) & 0x1f;
-        uint8_t g6 = (c >> 5) & 0x3f;
-        uint8_t b5 = c & 0x1f;
-        uint16_t r = (r5 * 255) / 31;
-        uint16_t g = (g6 * 255) / 63;
-        uint16_t b = (b5 * 255) / 31;
-        uint16_t luma = static_cast<uint16_t>((299u * r + 587u * g + 114u * b) / 1000u);
-        return (luma > 140) ? COLOUR_BLACK : COLOUR_WHITE;
-    };
-
-    const int cols = 4;
-    const int rows = 4;
-    int dispW = spDisplay->Width();
-    int dispH = spDisplay->Height();
-    int cellW = dispW / cols;
-    int cellH = dispH / rows;
-
-    auto nFontSize = spDisplay->get_recommended_font_size();
-    // Initialize display
-    spDisplay->SetFont(get_recommended_font(nFontSize));
-
-    for (auto nQuadrant : spDisplay->GetQuadrants())
-    {
-        spDisplay->SetQuadrant(nQuadrant);
-        spDisplay->Fill(COLOUR_BLACK);
-        for (int i = 0; i < 16; ++i)
-        {
-            int col = i % cols;
-            int row = i / cols;
-            int x = col * cellW;
-            int y = row * cellH;
-            int w = (col == cols - 1) ? (dispW - x) : cellW;
-            int h = (row == rows - 1) ? (dispH - y) : cellH;
-
-            spDisplay->FillRect(x, y, w, h, colours[i].value);
-            uint16_t textColour = text_colour_for_bg(colours[i].value);
-            spDisplay->Text(colours[i].name, x + 3, y + 3, textColour);
-            spDisplay->Text(colours[i].hex, x + 3, y + spDisplay->GetFont()->height + 3, textColour);
-        }
-
-        spDisplay->Show();
-    }
-    sleep_ms(2000);
-}
-#endif
